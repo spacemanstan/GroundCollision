@@ -12,12 +12,12 @@ Orb orb;
 
 PVector gravity = new PVector(0, 0.1, 0);
 
-int cols = 22;
-int rows = 22;
+int cols = 32;
+int rows = 32;
 
-float worldW = 600;
-float worldH = 600;
-float worldD = 600;
+float worldW = 1000;
+float worldH = 1000;
+float worldD = 1000;
 
 float cellW;
 float cellD;
