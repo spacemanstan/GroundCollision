@@ -1,23 +1,36 @@
 /**
- * 3D terrain version:
- * - 600x600 P3D
- * - lower-angle corner camera
- * - true ground depth via x/z heightfield grid
- * - random grey terrain cells
- * - terrain turns red while colliding, reverts after
- * - mouse press adds upward throw impulse + slight random lateral push
+ * Balls and walls prototype - if it's not a sphere, it's a plane
+ *
+ * Notes:
+ * - grounded support removes only into-ground velocity
+ * - movement is acceleration-based
+ * - arcade "car" feel using heading + throttle + lateral grip
+ * - follow camera
+ * - all world sizes are authored around a 0.1 voxel unit
+ *
+ * Coordinate note for Processing P3D:
+ * - +Y goes downward
+ * - smaller Y = higher up
+ *
+ * Balls & Walls:
+ * Simple physics system where everything is a sphere (ball) or plane (wall) to simplify collision detection
  */
 
-Orb orb;
+final float UNIT = 0.1f;       // 1 voxel = 0.1 world units
+final float EPS  = 0.0001f;
 
-PVector gravity = new PVector(0, 0.1, 0);
+BallCar car;
 
-int cols = 32;
-int rows = 32;
+PVector gravity = new PVector(0, u(0.25f), 0);   // +Y is downward
 
-float worldW = 1000;
-float worldH = 1000;
-float worldD = 1000;
+// Wider and longer terrain strip
+int cols = 48;
+int rows = 96;
+
+// World dimensions 
+float worldW = u(4000);   
+float worldH = u(1500); 
+float worldD = u(4000);  
 
 float cellW;
 float cellD;
@@ -25,88 +38,126 @@ float cellD;
 float[][] heights;
 GroundCell[][] cells;
 
+// Camera
+PVector camEye    = new PVector();
+PVector camTarget = new PVector();
+
+// Input
+boolean wDown = false;
+boolean aDown = false;
+boolean sDown = false;
+boolean dDown = false;
+boolean jumpQueued = false;
+
 void setup() {
   size(600, 600, P3D);
-  smooth(8);
+  noSmooth();
 
-  cellW = worldW / (cols - 1.0);
-  cellD = worldD / (rows - 1.0);
+  cellW = worldW / (cols - 1.0f);
+  cellD = worldD / (rows - 1.0f);
 
   generateTerrain();
 
-  orb = new Orb(90, 120, 90, 12);
+  car = new BallCar(u(120), u(180), u(120), u(14));  // 14 voxels radius = 1.4 world units
+  car.placeOnGround();
+
+  resetCameraImmediate();
 }
 
 void draw() {
   background(10);
 
-  setSceneCamera();
-  lights();
-
   clearCollisionFlags();
+  car.update();
 
-  orb.move();
-  orb.checkBounds();
-  orb.checkTerrainCollision();
+  setFollowCamera();
+  setupSceneLighting();
 
   drawTerrain();
-  orb.display();
-  
-  if(keyPressed) {
-    float fuck = 2.0;
-    
-    orb.velocity.y = -0.01;
-    
-    if(key == 'w') orb.velocity.x = fuck;
-    if(key == 's') orb.velocity.x = -fuck;
-    if(key == 'a') orb.velocity.z = -fuck;
-    if(key == 'd') orb.velocity.z = fuck;
-    if(key == ' ') orb.velocity.y = -2.5;
-    
-    key = ']';
-  }
+  car.display();
+
+  drawHUD();
 }
 
-void mousePressed() {
-  orb.kickUp();
+void setupSceneLighting() {
+  ambientLight(70, 70, 70);
+  directionalLight(200, 200, 200, -0.35f, 0.65f, -0.25f);
+  directionalLight(110, 100, 95, 0.45f, 0.2f, 0.35f);
 }
 
-void setSceneCamera() {
-  // lower than before, roughly same distance from scene
-  float cx = -150;
-  float cy = -110;
-  float cz = -150;
+void resetCameraImmediate() {
+  PVector fwd = car.getFlatForward();
+  PVector desiredEye = PVector.sub(car.position, PVector.mult(fwd, u(110)));
+  desiredEye.add(0, -u(55), 0);
 
-  float tx = worldW * 0.5;
-  float ty = worldH * 0.70;
-  float tz = worldD * 0.5;
+  PVector desiredTarget = PVector.add(car.position, PVector.mult(fwd, u(24)));
+  desiredTarget.add(0, -u(10), 0);
 
-  camera(cx, cy, cz, tx, ty, tz, 0, 1, 0);
+  camEye.set(desiredEye);
+  camTarget.set(desiredTarget);
+}
+
+void setFollowCamera() {
+  PVector fwd = car.getFlatForward();
+
+  PVector desiredEye = PVector.sub(car.position, PVector.mult(fwd, u(110)));
+  desiredEye.add(0, -u(55), 0);
+
+  // keep camera above terrain a bit
+  float sampleX = constrain(desiredEye.x, 0, worldW - EPS);
+  float sampleZ = constrain(desiredEye.z, 0, worldD - EPS);
+  float camGroundY = terrainHeightAt(sampleX, sampleZ);
+  float minCameraY = camGroundY - u(36); // smaller Y = higher
+  if (desiredEye.y > minCameraY) desiredEye.y = minCameraY;
+
+  PVector desiredTarget = PVector.add(car.position, PVector.mult(fwd, u(24)));
+  desiredTarget.add(0, -u(10), 0);
+
+  camEye.lerp(desiredEye, 0.12f);
+  camTarget.lerp(desiredTarget, 0.18f);
+
+  camera(
+    camEye.x, camEye.y, camEye.z,
+    camTarget.x, camTarget.y, camTarget.z,
+    0, 1, 0
+    );
+
+  perspective(PI/3.0, width/height, 0.1, 10000);
 }
 
 void generateTerrain() {
   heights = new float[cols][rows];
   cells   = new GroundCell[cols - 1][rows - 1];
 
-  noiseDetail(4, 0.5);
+  noiseDetail(4, 0.52f);
 
-  float nScale = 0.16;
+  float nScaleA = 0.075f;
+  float nScaleB = 0.028f;
+
   for (int i = 0; i < cols; i++) {
     for (int j = 0; j < rows; j++) {
-      float nx = i * nScale;
-      float nz = j * nScale;
+      float nxA = i * nScaleA;
+      float nzA = j * nScaleA;
 
-      // broad rolling shape, biased toward the lower half of the screen
-      float h = map(noise(nx, nz), 0, 1, worldH - 210, worldH - 40);
-      heights[i][j] = h;
+      float nxB = i * nScaleB + 200.0f;
+      float nzB = j * nScaleB + 600.0f;
+
+      float broad = noise(nxA, nzA);
+      float large = noise(nxB, nzB);
+
+      float hA = map(broad, 0, 1, worldH * 0.50f, worldH * 0.82f);
+      float hB = map(large, 0, 1, -u(22), u(22));
+
+      float h = hA + hB;
+      heights[i][j] = snapToVoxel(h);
     }
   }
 
   for (int i = 0; i < cols - 1; i++) {
     for (int j = 0; j < rows - 1; j++) {
       float baseGrey;
-      if ((i + j) % 2 == 0) baseGrey = random(80, 125);
-      else                  baseGrey = random(135, 185);
+      if ((i + j) % 2 == 0) baseGrey = random(88, 125);
+      else                  baseGrey = random(132, 176);
 
       cells[i][j] = new GroundCell(i, j, baseGrey);
     }
@@ -130,8 +181,8 @@ void drawTerrain() {
 }
 
 float terrainHeightAt(float x, float z) {
-  x = constrain(x, 0, worldW - 0.001);
-  z = constrain(z, 0, worldD - 0.001);
+  x = constrain(x, 0, worldW - EPS);
+  z = constrain(z, 0, worldD - EPS);
 
   int i = constrain(floor(x / cellW), 0, cols - 2);
   int j = constrain(floor(z / cellD), 0, rows - 2);
@@ -139,23 +190,22 @@ float terrainHeightAt(float x, float z) {
   float x0 = i * cellW;
   float z0 = j * cellD;
 
-  float u = (x - x0) / cellW;
-  float v = (z - z0) / cellD;
+  float uCoord = (x - x0) / cellW;
+  float vCoord = (z - z0) / cellD;
 
   float h00 = heights[i][j];
   float h10 = heights[i + 1][j];
   float h01 = heights[i][j + 1];
   float h11 = heights[i + 1][j + 1];
 
-  // bilinear interpolation over the cell
-  float h0 = lerp(h00, h10, u);
-  float h1 = lerp(h01, h11, u);
-  return lerp(h0, h1, v);
+  float h0 = lerp(h00, h10, uCoord);
+  float h1 = lerp(h01, h11, uCoord);
+  return lerp(h0, h1, vCoord);
 }
 
 PVector terrainNormalAt(float x, float z) {
-  float epsX = cellW * 0.35;
-  float epsZ = cellD * 0.35;
+  float epsX = max(u(4), cellW * 0.30f);
+  float epsZ = max(u(4), cellD * 0.30f);
 
   float xL = max(0, x - epsX);
   float xR = min(worldW, x + epsX);
@@ -173,10 +223,41 @@ PVector terrainNormalAt(float x, float z) {
   PVector n = tx.cross(tz);
   n.normalize();
 
-  // make sure it points upward
+  // upward in Processing 3D means negative Y
   if (n.y > 0) n.mult(-1);
 
   return n;
+}
+
+PVector projectOntoPlane(PVector v, PVector n) {
+  return PVector.sub(v, PVector.mult(n, v.dot(n)));
+}
+
+float u(float voxels) {
+  return voxels * UNIT;
+}
+
+float snapToVoxel(float v) {
+  return round(v / UNIT) * UNIT;
+}
+
+void drawHUD() {
+  hint(DISABLE_DEPTH_TEST);
+  camera();
+  noLights();
+
+  fill(255);
+  textAlign(LEFT, TOP);
+  text(
+    "FPS: " + nf(frameRate, 1, 3) +
+    "\nspeed: " + nf(car.getPlanarSpeed(), 1, 3) +
+    "\nyaw: " + nf(degrees(car.yaw), 1, 2) +
+    "\ngrounded: " + car.grounded +
+    "\nW/S throttle  A/D steer  SPACE jump  click bump",
+    12, 12
+    );
+
+  hint(ENABLE_DEPTH_TEST);
 }
 
 class GroundCell {
@@ -184,10 +265,10 @@ class GroundCell {
   float baseGrey;
   boolean colliding = false;
 
-  GroundCell(int i, int j, float baseGrey) {
-    this.i = i;
-    this.j = j;
-    this.baseGrey = baseGrey;
+  GroundCell(int i_, int j_, float baseGrey_) {
+    i = i_;
+    j = j_;
+    baseGrey = baseGrey_;
   }
 
   void display() {
@@ -204,10 +285,20 @@ class GroundCell {
     pushStyle();
     noStroke();
 
-    if (colliding) fill(220, 40, 40);
-    else fill(baseGrey);
+    color topBase   = color(baseGrey);
+    color frontBase = color(max(0, baseGrey - 16));
+    color leftBase  = color(max(0, baseGrey - 30));
 
-    // top face
+    // softer orange tint instead of hard red replacement
+    float topMix   = colliding ? 0.34f : 0.0f;
+    float frontMix = colliding ? 0.28f : 0.0f;
+    float leftMix  = colliding ? 0.24f : 0.0f;
+
+    color topHit   = color(232, 142, 78);
+    color frontHit = color(212, 122, 62);
+    color leftHit  = color(186, 102, 50);
+
+    fill(lerpColor(topBase, topHit, topMix));
     beginShape(QUADS);
     vertex(x0, h00, z0);
     vertex(x1, h10, z0);
@@ -215,9 +306,7 @@ class GroundCell {
     vertex(x0, h01, z1);
     endShape();
 
-    // front edge wall at z0
-    if (colliding) fill(180, 30, 30);
-    else fill(max(0, baseGrey - 18));
+    fill(lerpColor(frontBase, frontHit, frontMix));
     beginShape(QUADS);
     vertex(x0, h00, z0);
     vertex(x1, h10, z0);
@@ -225,9 +314,7 @@ class GroundCell {
     vertex(x0, worldH, z0);
     endShape();
 
-    // left edge wall at x0
-    if (colliding) fill(160, 22, 22);
-    else fill(max(0, baseGrey - 34));
+    fill(lerpColor(leftBase, leftHit, leftMix));
     beginShape(QUADS);
     vertex(x0, h00, z0);
     vertex(x0, h01, z1);
@@ -239,104 +326,306 @@ class GroundCell {
   }
 }
 
-class Orb {
+class BallCar {
   PVector position;
   PVector velocity;
-  float r;
-  float damping = 0.5;
-  float friction = 0.01;
+  PVector groundNormal;
 
-  Orb(float x, float y, float z, float r_) {
-    position = new PVector(x, y, z);
-    velocity = new PVector(1.4, 0, 1.0);
-    r = r_;
+  float r;
+  float yaw = 0;
+
+  boolean grounded = false;
+
+  // --- tuning ---
+  //float engineAccel      = u(0.38f);
+  //float brakeAccel       = u(0.52f);
+  //float airAccel         = u(0.08f);
+  float engineAccel      = u(0.42f);
+  float brakeAccel       = u(0.42f);
+  float airAccel         = u(0.12f);
+
+
+  float maxForwardSpeed  = u(7.0f);
+  float maxReverseSpeed  = u(3.0f);
+  float maxPlanarSpeed   = u(6.6f);
+
+  float lateralGrip      = 0.12f;   // higher = tighter / less slide
+  float driveDrag        = 0.012f;
+  float coastDrag        = 0.035f;
+  float airDrag          = 0.006f;
+
+  float steerRate        = 0.030f;
+  float jumpSpeed        = u(4.4f);
+
+  float groundSnapDist   = u(1.2f);
+  float groundDetachSpeed = u(2.0f); // if moving away from ground faster than this, don't snap
+
+  BallCar(float x, float y, float z, float radius_) {
+    position = new PVector(snapToVoxel(x), snapToVoxel(y), snapToVoxel(z));
+    velocity = new PVector();
+    groundNormal = new PVector(0, -1, 0);
+    r = radius_;
   }
 
-  void move() {
+  void placeOnGround() {
+    float gy = terrainHeightAt(position.x, position.z);
+    position.y = gy - r;
+    grounded = true;
+    groundNormal.set(terrainNormalAt(position.x, position.z));
+  }
+
+  void update() {
+    consumeJump();
+
+    float throttle = 0;
+    float steer = 0;
+
+    if (wDown) throttle += 1;
+    if (sDown) throttle -= 1;
+    if (aDown) steer -= 1;
+    if (dDown) steer += 1;
+
+    if (grounded) {
+      applyGroundDrive(throttle, steer);
+    } else {
+      applyAirControl(throttle, steer);
+    }
+
     velocity.add(gravity);
     position.add(velocity);
+
+    solveBounds();
+    solveTerrainCollision();
   }
 
-  void kickUp() {
-    // upward = negative y in Processing's 3D coordinates
-    velocity.y = random(-6.5, -4.8);
+  void consumeJump() {
+    if (jumpQueued && grounded) {
+      velocity.add(PVector.mult(groundNormal, jumpSpeed));
+      position.add(PVector.mult(groundNormal, u(2)));
+      grounded = false;
+    }
+    jumpQueued = false;
+  }
 
-    // slight random lateral push so it gets thrown around
-    velocity.x += random(-1.6, 1.6);
-    velocity.z += random(-1.6, 1.6);
+  void applyGroundDrive(float throttle, float steer) {
+    PVector n = groundNormal.copy();
+
+    PVector vN = PVector.mult(n, velocity.dot(n));
+    PVector vT = PVector.sub(velocity, vN);
+
+    PVector forward = getForwardOnPlane(n);
+    PVector right = n.cross(forward);
+    if (right.magSq() < 0.000001f) right = new PVector(0, 0, 1);
+    else right.normalize();
+
+    float forwardSpeed = vT.dot(forward);
+    float sideSpeed = vT.dot(right);
+
+    float steerFactor = 0.25f + 0.75f * min(abs(forwardSpeed) / maxForwardSpeed, 1.0f);
+    yaw += steer * steerRate * steerFactor;
+
+    // recalc after yaw changes
+    forward = getForwardOnPlane(n);
+    right = n.cross(forward);
+    if (right.magSq() < 0.000001f) right = new PVector(0, 0, 1);
+    else right.normalize();
+
+    forwardSpeed = vT.dot(forward);
+    sideSpeed = vT.dot(right);
+
+    if (throttle > 0) {
+      vT.add(PVector.mult(forward, engineAccel * throttle));
+    } else if (throttle < 0) {
+      vT.add(PVector.mult(forward, brakeAccel * throttle));
+    }
+
+    // kill sideways slide without killing all tangential motion
+    vT.add(PVector.mult(right, -sideSpeed * lateralGrip));
+
+    // drag
+    if (abs(throttle) < 0.001f) vT.mult(1.0f - coastDrag);
+    else                        vT.mult(1.0f - driveDrag);
+
+    // clamp forward / reverse speed
+    forwardSpeed = vT.dot(forward);
+    float clampedForward = constrain(forwardSpeed, -maxReverseSpeed, maxForwardSpeed);
+    vT.add(PVector.mult(forward, clampedForward - forwardSpeed));
+
+    // extra safety clamp on total planar speed
+    if (vT.mag() > maxPlanarSpeed) {
+      vT.normalize().mult(maxPlanarSpeed);
+    }
+
+    velocity.set(PVector.add(vT, vN));
+  }
+
+  void applyAirControl(float throttle, float steer) {
+    PVector forward = getFlatForward();
+
+    if (abs(throttle) > 0.001f) {
+      velocity.add(PVector.mult(forward, throttle * airAccel));
+    }
+
+    yaw += steer * steerRate * 0.35f;
+    velocity.mult(1.0f - airDrag);
+  }
+
+  void solveBounds() {
+    if (position.x < r) {
+      position.x = r;
+      if (velocity.x < 0) velocity.x = 0;
+    } else if (position.x > worldW - r) {
+      position.x = worldW - r;
+      if (velocity.x > 0) velocity.x = 0;
+    }
+
+    if (position.z < r) {
+      position.z = r;
+      if (velocity.z < 0) velocity.z = 0;
+    } else if (position.z > worldD - r) {
+      position.z = worldD - r;
+      if (velocity.z > 0) velocity.z = 0;
+    }
+
+    if (position.y < r) {
+      position.y = r;
+      if (velocity.y < 0) velocity.y = 0;
+    }
+
+    // fail-safe reset if something goes badly wrong
+    if (position.y > worldH + u(180)) {
+      position.set(u(120), u(160), u(120));
+      velocity.set(0, 0, 0);
+      yaw = 0;
+      placeOnGround();
+    }
+  }
+
+  void solveTerrainCollision() {
+    grounded = false;
+
+    float groundY = terrainHeightAt(position.x, position.z);
+    PVector n = terrainNormalAt(position.x, position.z);
+
+    float verticalCorrection = (position.y + r) - groundY; // >0 = penetrating, <0 = hovering
+    float vn = velocity.dot(n);                            // relative to upward normal
+
+    boolean canSnap =
+      verticalCorrection >= -groundSnapDist &&
+      vn < groundDetachSpeed;
+
+    if (canSnap) {
+      float correctionDist = verticalCorrection / max(0.15f, -n.y);
+      position.add(PVector.mult(n, correctionDist));
+
+      // remove only velocity into the surface
+      vn = velocity.dot(n);
+      if (vn < 0) {
+        velocity.sub(PVector.mult(n, vn));
+      }
+
+      grounded = true;
+      groundNormal.set(n);
+      markCollidingCell(position.x, position.z);
+    } else {
+      groundNormal.set(0, -1, 0);
+    }
+  }
+
+  PVector getFlatForward() {
+    PVector f = new PVector(cos(yaw), 0, sin(yaw));
+    if (f.magSq() < 0.000001f) f.set(1, 0, 0);
+    else f.normalize();
+    return f;
+  }
+
+  PVector getForwardOnPlane(PVector n) {
+    PVector f = new PVector(cos(yaw), 0, sin(yaw));
+    f = projectOntoPlane(f, n);
+    if (f.magSq() < 0.000001f) f = new PVector(1, 0, 0);
+    else f.normalize();
+    return f;
+  }
+
+  float getPlanarSpeed() {
+    PVector n = grounded ? groundNormal : new PVector(0, -1, 0);
+    PVector vT = PVector.sub(velocity, PVector.mult(n, velocity.dot(n)));
+    return vT.mag();
+  }
+
+  void bump() {
+    PVector n = grounded ? groundNormal.copy() : new PVector(0, -1, 0);
+    velocity.add(PVector.mult(n, u(3.8f)));
+
+    PVector side = new PVector(random(-1, 1), 0, random(-1, 1));
+    if (side.magSq() > 0.000001f) side.normalize();
+    velocity.add(PVector.mult(side, u(1.5f)));
   }
 
   void display() {
     pushMatrix();
     translate(position.x, position.y, position.z);
+
     noStroke();
-    fill(215);
-    sphereDetail(20);
+
+    // main body sphere
+    fill(210);
+    sphereDetail(18);
     sphere(r);
+
+    // directional nose so heading reads like a tiny car
+    pushMatrix();
+    rotateY(yaw);
+    translate(r * 0.82f, 0, 0);
+    fill(245, 190, 120);
+    box(r * 0.9f, r * 0.25f, r * 0.38f);
+    popMatrix();
+
+    // top marker
+    pushMatrix();
+    translate(0, -r * 0.65f, 0);
+    fill(90, 90, 95);
+    box(r * 0.65f, r * 0.16f, r * 0.65f);
+    popMatrix();
+
     popMatrix();
   }
 
-  void checkBounds() {
-    if (position.x < r) {
-      position.x = r;
-      velocity.x *= -damping;
-    } else if (position.x > worldW - r) {
-      position.x = worldW - r;
-      velocity.x *= -damping;
-    }
-
-    if (position.z < r) {
-      position.z = r;
-      velocity.z *= -damping;
-    } else if (position.z > worldD - r) {
-      position.z = worldD - r;
-      velocity.z *= -damping;
-    }
-
-    if (position.y < r) {
-      position.y = r;
-      velocity.y *= -damping;
-    }
-  }
-
-  void checkTerrainCollision() {
-    float groundY = terrainHeightAt(position.x, position.z);
-    float bottomY = position.y + r;
-
-    // contact only when sphere bottom reaches terrain and moving into it
-    if (bottomY >= groundY && velocity.y >= -0.2) {
-      PVector n = terrainNormalAt(position.x, position.z);
-
-      // project sphere center to sit exactly one radius above terrain along world up
-      position.y = groundY - r;
-
-      // reflect velocity about terrain normal
-      float vn = velocity.dot(n);
-
-      // only respond if moving into the surface
-      if (vn < 0) {
-        PVector reflected = PVector.sub(velocity, PVector.mult(n, 2.0 * vn));
-        velocity.set(reflected);
-        velocity.mult(damping);
-      }
-
-      // tangential damping to reduce chatter
-      velocity.x *= friction;
-      velocity.z *= friction;
-
-      markCollidingCell(position.x, position.z);
-    }
-  }
-
+  /*
+  * Helper Debug Visual function to highlight cells 
+  */
   void markCollidingCell(float x, float z) {
-    int i = constrain(floor(x / cellW), 0, cols - 2);
-    int j = constrain(floor(z / cellD), 0, rows - 2);
-    cells[i][j].colliding = true;
+    // translate position into grid indices
+    int xCellAxisIndex = constrain(floor(x / cellW), 0, cols - 2); // width
+    int zCellAxisIndex = constrain(floor(z / cellD), 0, rows - 2); // depth
 
-    // mark neighbors too so the red patch reads as area contact, not a single tile
-    if (i > 0)         cells[i - 1][j].colliding = true;
-    if (i < cols - 2)  cells[i + 1][j].colliding = true;
-    if (j > 0)         cells[i][j - 1].colliding = true;
-    if (j < rows - 2)  cells[i][j + 1].colliding = true;
+    // enable collision indication bool - changes colour of ground cell currently
+    cells[xCellAxisIndex][zCellAxisIndex].colliding = true;
+
+    // adjaceny check  - flag neighbors too 
+    if (xCellAxisIndex > 0)         cells[xCellAxisIndex - 1][zCellAxisIndex].colliding = true;
+    if (xCellAxisIndex < cols - 2)  cells[xCellAxisIndex + 1][zCellAxisIndex].colliding = true;
+    if (zCellAxisIndex > 0)         cells[xCellAxisIndex][zCellAxisIndex - 1].colliding = true;
+    if (zCellAxisIndex < rows - 2)  cells[xCellAxisIndex][zCellAxisIndex + 1].colliding = true;
   }
+}
+
+void mousePressed() {
+  car.bump();
+}
+
+void keyPressed() {
+  if (key == 'w' || key == 'W') wDown = true;
+  if (key == 'a' || key == 'A') aDown = true;
+  if (key == 's' || key == 'S') sDown = true;
+  if (key == 'd' || key == 'D') dDown = true;
+
+  if (key == ' ') jumpQueued = true;
+}
+
+void keyReleased() {
+  if (key == 'w' || key == 'W') wDown = false;
+  if (key == 'a' || key == 'A') aDown = false;
+  if (key == 's' || key == 'S') sDown = false;
+  if (key == 'd' || key == 'D') dDown = false;
 }
