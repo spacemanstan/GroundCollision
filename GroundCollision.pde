@@ -13,28 +13,31 @@
  * - smaller Y = higher up
  *
  * Balls & Walls:
- * Simple physics system where everything is a sphere (ball) or plane (wall) to simplify collision detection
+ * Simple physics system where everything is a sphere (ball) or plane (wall)
+ * so collision stays cheap and easy to reason about.
  */
 
-final float UNIT = 0.1f;       // 1 voxel = 0.1 world units
-final float EPS  = 0.0001f; // what is EPS ?
+final float UNIT = 0.1f;     // 1 voxel = 0.1 world units
+final float EPS  = 0.0001f;  // tiny offset used when sampling near edges so we do not hit the last cell boundary exactly
 
 Ball player;
 
-PVector gravity = new PVector(0, u(0.25f), 0);   // +Y is downward
+PVector gravity = new PVector(0, u(0.25f), 0);   // +Y is downward in Processing P3D
 
-// Wider and longer terrain strip
+// Terrain grid resolution
 int cols = 48;
 int rows = 96;
 
-// World dimensions 
-float worldW = u(4000);   
-float worldH = u(1500); 
-float worldD = u(4000);  
+// World dimensions
+float worldW = u(4000);
+float worldH = u(1500);
+float worldD = u(4000);
 
+// Cached terrain cell size
 float cellW;
 float cellD;
 
+// Heightmap data + render cells
 float[][] heights;
 GroundCell[][] cells;
 
@@ -58,7 +61,8 @@ void setup() {
 
   generateTerrain();
 
-  player = new Ball(u(120), u(180), u(120), u(14));  // 14 voxels radius = 1.4 world units
+  // spawn above terrain, then snap down onto the support surface
+  player = new Ball(u(120), u(180), u(120), u(14));
   player.placeOnGround();
 
   resetCameraImmediate();
@@ -85,8 +89,12 @@ void setupSceneLighting() {
   directionalLight(110, 100, 95, 0.45f, 0.2f, 0.35f);
 }
 
+/*
+ * Hard snap camera into place on startup so it does not ease in from origin.
+ */
 void resetCameraImmediate() {
   PVector flatForward = player.getFlatForward();
+
   PVector desiredEye = PVector.sub(player.position, PVector.mult(flatForward, u(110)));
   desiredEye.add(0, -u(55), 0);
 
@@ -97,13 +105,20 @@ void resetCameraImmediate() {
   camTarget.set(desiredTarget);
 }
 
+/*
+ * Follow camera:
+ * - sits behind the current heading
+ * - looks slightly ahead of the player
+ * - gets lifted if terrain would clip into it
+ * - eases toward the desired position for smoother motion
+ */
 void setFollowCamera() {
   PVector flatForward = player.getFlatForward();
 
   PVector desiredEye = PVector.sub(player.position, PVector.mult(flatForward, u(110)));
   desiredEye.add(0, -u(55), 0);
 
-  // keep camera above terrain a bit
+  // sample terrain under the desired eye point and keep the camera above it
   float sampleX = constrain(desiredEye.x, 0, worldW - EPS);
   float sampleZ = constrain(desiredEye.z, 0, worldD - EPS);
   float camGroundY = terrainHeightAt(sampleX, sampleZ);
@@ -117,56 +132,67 @@ void setFollowCamera() {
   camTarget.lerp(desiredTarget, 0.18f);
 
   camera(
-    camEye.x, camEye.y, camEye.z, /* cam pos */
-    camTarget.x, camTarget.y, camTarget.z, /* eye target pos */
-    0, 1, 0 /* up */
-    );
+    camEye.x, camEye.y, camEye.z,       /* camera position */
+    camTarget.x, camTarget.y, camTarget.z, /* look target */
+    0, 1, 0                             /* up vector */
+  );
 
-  perspective(PI/3.0, width/height, 0.1, 10000);
+  perspective(PI / 3.0f, (float) width / (float) height, 0.1f, 10000.0f);
 }
 
+/*
+ * Create a height map terrain using 2 noise layers:
+ * - one for broad rolling shape
+ * - one for larger offset variation
+ *
+ * Final heights are snapped to the voxel grid so terrain values stay clean.
+ */
 void generateTerrain() {
   heights = new float[cols][rows];
   cells   = new GroundCell[cols - 1][rows - 1];
 
   noiseDetail(4, 0.52f);
 
-  float normScale_A = 0.075f;
-  float normScale_B = 0.028f;
+  float mediumNoiseScale = 0.075f;
+  float largeNoiseScale  = 0.028f;
 
-  // calculate random height map based terrain
+  // calculate heightmap values first
   for (int indexWidth = 0; indexWidth < cols; ++indexWidth) {
     for (int indexDepth = 0; indexDepth < rows; ++indexDepth) {
-      float normalWidth_A = indexWidth * normScale_A;
-      float normalDepth_A = indexDepth * normScale_A;
+      float mediumNoiseWidth = indexWidth * mediumNoiseScale;
+      float mediumNoiseDepth = indexDepth * mediumNoiseScale;
 
-      float normalWidth_B = indexWidth * normScale_B + 200.0f;
-      float normalDepth_B = indexDepth * normScale_B + 600.0f;
+      float largeNoiseWidth = indexWidth * largeNoiseScale + 200.0f;
+      float largeNoiseDepth = indexDepth * largeNoiseScale + 600.0f;
 
-      float broad = noise(normalWidth_A, normalDepth_A);
-      float large = noise(normalWidth_B, normalDepth_B);
+      float broadNoise = noise(mediumNoiseWidth, mediumNoiseDepth);
+      float largeNoise = noise(largeNoiseWidth, largeNoiseDepth);
 
-      float height_A = map(broad, 0, 1, worldH * 0.50f, worldH * 0.82f);
-      float height_B = map(large, 0, 1, -u(22), u(22));
+      float baseHeight = map(broadNoise, 0, 1, worldH * 0.50f, worldH * 0.82f);
+      float heightOffset = map(largeNoise, 0, 1, -u(22), u(22));
 
-      float heightAdjusted = height_A + height_B;
+      float heightAdjusted = baseHeight + heightOffset;
       heights[indexWidth][indexDepth] = snapToVoxel(heightAdjusted);
     }
   }
 
-  // generate the actual grid
+  // build the visible terrain cells from the heightmap
   for (int indexWidth = 0; indexWidth < cols - 1; ++indexWidth) {
     for (int indexDepth = 0; indexDepth < rows - 1; ++indexDepth) {
       float baseGrey;
+
       if ((indexWidth + indexDepth) % 2 == 0) baseGrey = random(88, 125);
-      else                  baseGrey = random(132, 176);
+      else                                    baseGrey = random(132, 176);
 
       cells[indexWidth][indexDepth] = new GroundCell(indexWidth, indexDepth, baseGrey);
     }
   }
 }
 
-// used to ...
+/*
+ * Collision tint is recalculated every frame.
+ * Clear all touched cell flags first, then let the current frame's contact solve mark them again.
+ */
 void clearCollisionFlags() {
   for (int indexWidth = 0; indexWidth < cols - 1; ++indexWidth) {
     for (int indexDepth = 0; indexDepth < rows - 1; ++indexDepth) {
@@ -175,7 +201,6 @@ void clearCollisionFlags() {
   }
 }
 
-// used to ...
 void drawTerrain() {
   for (int indexWidth = 0; indexWidth < cols - 1; ++indexWidth) {
     for (int indexDepth = 0; indexDepth < rows - 1; ++indexDepth) {
@@ -184,18 +209,22 @@ void drawTerrain() {
   }
 }
 
-float terrainHeightAt(float x_, float z_) {
-  x_ = constrain(x_, 0, worldW - EPS);
-  z_ = constrain(z_, 0, worldD - EPS);
+/*
+ * Sample the terrain height at any X/Z world position using bilinear interpolation.
+ * This makes terrain support smooth even though the heightmap is stored on a grid.
+ */
+float terrainHeightAt(float worldX, float worldZ) {
+  worldX = constrain(worldX, 0, worldW - EPS);
+  worldZ = constrain(worldZ, 0, worldD - EPS);
 
-  int indexWidth = constrain(floor(x_ / cellW), 0, cols - 2);
-  int indexDepth = constrain(floor(z_ / cellD), 0, rows - 2);
+  int indexWidth = constrain(floor(worldX / cellW), 0, cols - 2);
+  int indexDepth = constrain(floor(worldZ / cellD), 0, rows - 2);
 
   float x0 = indexWidth * cellW;
   float z0 = indexDepth * cellD;
 
-  float uCoord = (x_ - x0) / cellW;
-  float vCoord = (z_ - z0) / cellD;
+  float uCoord = (worldX - x0) / cellW;
+  float vCoord = (worldZ - z0) / cellD;
 
   float h00 = heights[indexWidth][indexDepth];
   float h10 = heights[indexWidth + 1][indexDepth];
@@ -204,35 +233,44 @@ float terrainHeightAt(float x_, float z_) {
 
   float h0 = lerp(h00, h10, uCoord);
   float h1 = lerp(h01, h11, uCoord);
+
   return lerp(h0, h1, vCoord);
 }
 
-PVector terrainNormalAt(float x_, float z_) {
-  float epsX = max(u(4), cellW * 0.30f);
-  float epsZ = max(u(4), cellD * 0.30f);
+/*
+ * Estimate the terrain normal by sampling nearby heights in X and Z.
+ * The cross product gives the slope direction, then we flip it if needed so it points upward.
+ */
+PVector terrainNormalAt(float worldX, float worldZ) {
+  float sampleOffsetX = max(u(4), cellW * 0.30f);
+  float sampleOffsetZ = max(u(4), cellD * 0.30f);
 
-  float xL = max(0, x_ - epsX);
-  float xR = min(worldW, x_ + epsX);
-  float zD = max(0, z_ - epsZ);
-  float zU = min(worldD, z_ + epsZ);
+  float xL = max(0, worldX - sampleOffsetX);
+  float xR = min(worldW, worldX + sampleOffsetX);
+  float zD = max(0, worldZ - sampleOffsetZ);
+  float zU = min(worldD, worldZ + sampleOffsetZ);
 
-  float hL = terrainHeightAt(xL, z_);
-  float hR = terrainHeightAt(xR, z_);
-  float hD = terrainHeightAt(x_, zD);
-  float hU = terrainHeightAt(x_, zU);
+  float hL = terrainHeightAt(xL, worldZ);
+  float hR = terrainHeightAt(xR, worldZ);
+  float hD = terrainHeightAt(worldX, zD);
+  float hU = terrainHeightAt(worldX, zU);
 
-  PVector tx = new PVector(xR - xL, hR - hL, 0);
-  PVector tz = new PVector(0, hU - hD, zU - zD);
+  PVector tangentX = new PVector(xR - xL, hR - hL, 0);
+  PVector tangentZ = new PVector(0, hU - hD, zU - zD);
 
-  PVector n = tx.cross(tz);
-  n.normalize();
+  PVector normal = tangentX.cross(tangentZ);
+  normal.normalize();
 
-  // upward in Processing 3D means negative Y
-  if (n.y > 0) n.mult(-1);
+  // upward in Processing P3D means negative Y
+  if (normal.y > 0) normal.mult(-1);
 
-  return n;
+  return normal;
 }
 
+/*
+ * Remove the part of vector v that points along normal n.
+ * Result is the piece of motion that lies along the plane.
+ */
 PVector projectOntoPlane(PVector v, PVector n) {
   return PVector.sub(v, PVector.mult(n, v.dot(n)));
 }
@@ -241,8 +279,12 @@ float u(float voxels) {
   return voxels * UNIT;
 }
 
-float snapToVoxel(float v) {
-  return round(v / UNIT) * UNIT;
+/*
+ * Snap authored/static values onto the 0.1 unit grid.
+ * Avoid doing this to live dynamic motion every frame or the movement gets jittery.
+ */
+float snapToVoxel(float value) {
+  return round(value / UNIT) * UNIT;
 }
 
 void drawHUD() {
@@ -259,7 +301,7 @@ void drawHUD() {
     "\ngrounded: " + player.grounded +
     "\nW/S throttle  A/D steer  SPACE jump  click bump",
     12, 12
-    );
+  );
 
   hint(ENABLE_DEPTH_TEST);
 }
@@ -269,9 +311,9 @@ class GroundCell {
   float baseGrey;
   boolean colliding = false;
 
-  GroundCell(int i_, int j_, float baseGrey_) {
-    indexWidth = i_;
-    indexDepth = j_;
+  GroundCell(int indexWidth_, int indexDepth_, float baseGrey_) {
+    indexWidth = indexWidth_;
+    indexDepth = indexDepth_;
     baseGrey = baseGrey_;
   }
 
@@ -293,7 +335,7 @@ class GroundCell {
     color frontBase = color(max(0, baseGrey - 16));
     color leftBase  = color(max(0, baseGrey - 30));
 
-    // softer orange tint instead of hard red replacement
+    // softer orange collision tint instead of a harsh full-red swap
     float topMix   = colliding ? 0.34f : 0.0f;
     float frontMix = colliding ? 0.28f : 0.0f;
     float leftMix  = colliding ? 0.24f : 0.0f;
@@ -341,24 +383,24 @@ class Ball {
   boolean grounded = false;
 
   // --- tuning ---
-  float engineAccel      = u(0.38f);
-  float brakeAccel       = u(0.52f);
-  float airAccel         = u(0.08f);
+  float engineAccel = u(0.38f);
+  float brakeAccel  = u(0.52f);
+  float airAccel    = u(0.08f);
 
-  float maxForwardSpeed  = u(7.0f);
-  float maxReverseSpeed  = u(3.0f);
-  float maxPlanarSpeed   = u(6.6f);
+  float maxForwardSpeed = u(7.0f);
+  float maxReverseSpeed = u(3.0f);
+  float maxPlanarSpeed  = u(6.6f);
 
-  float lateralGrip      = 0.12f;   // higher = tighter / less slide
-  float driveDrag        = 0.012f;
-  float coastDrag        = 0.035f;
-  float airDrag          = 0.006f;
+  float lateralGrip = 0.12f;   // higher = tighter / less sideways drift
+  float driveDrag   = 0.012f;
+  float coastDrag   = 0.035f;
+  float airDrag     = 0.006f;
 
-  float steerRate        = 0.030f;
-  float jumpSpeed        = u(4.4f);
+  float steerRate = 0.030f;
+  float jumpSpeed = u(4.4f);
 
-  float groundSnapDist   = u(1.2f);
-  float groundDetachSpeed = u(2.0f); // if moving away from ground faster than this, don't snap
+  float groundSnapDist     = u(1.2f);
+  float groundDetachSpeed  = u(2.0f); // if moving away from the ground too quickly, stop snapping to it
 
   Ball(float x_, float y_, float z_, float radius_) {
     position = new PVector(snapToVoxel(x_), snapToVoxel(y_), snapToVoxel(z_));
@@ -367,13 +409,27 @@ class Ball {
     radius = radius_;
   }
 
+  /*
+   * Spawn/reset helper.
+   * Find support height below the sphere and place it so the bottom just touches the ground.
+   */
   void placeOnGround() {
-    float gy = terrainHeightAt(position.x, position.z);
-    position.y = gy - radius;
+    float groundY = terrainHeightAt(position.x, position.z);
+    position.y = groundY - radius;
     grounded = true;
     groundNormal.set(terrainNormalAt(position.x, position.z));
   }
 
+  /*
+   * Main update order:
+   * 1. consume jump input
+   * 2. build simple throttle + steer input
+   * 3. apply ground or air movement
+   * 4. integrate gravity
+   * 5. move position
+   * 6. solve world bounds
+   * 7. solve terrain support
+   */
   void update() {
     consumeJump();
 
@@ -398,67 +454,96 @@ class Ball {
     solveTerrainCollision();
   }
 
+  /*
+   * Jump pushes along the current ground normal instead of straight world-up.
+   * That makes jumps behave better on slopes.
+   */
   void consumeJump() {
     if (jumpQueued && grounded) {
       velocity.add(PVector.mult(groundNormal, jumpSpeed));
-      position.add(PVector.mult(groundNormal, u(2)));
+      position.add(PVector.mult(groundNormal, u(2))); // small extra push so we leave the support cleanly
       grounded = false;
     }
+
     jumpQueued = false;
   }
 
+  /*
+   * Ground movement model:
+   * - split velocity into normal and tangent pieces
+   * - tangent = motion along the ground plane
+   * - normal = motion into / away from the ground
+   *
+   * We only steer and accelerate the tangent part.
+   * The normal part is preserved separately so support physics stays stable.
+   */
   void applyGroundDrive(float throttle, float steer) {
-    PVector grndNorm = groundNormal.copy();
+    PVector supportNormal = groundNormal.copy();
 
-    PVector velocityNormal = PVector.mult(grndNorm, velocity.dot(grndNorm));
+    // velocityNormal = motion pointing into / out of the support normal
+    PVector velocityNormal = PVector.mult(supportNormal, velocity.dot(supportNormal));
+
+    // velocityTangent = motion sliding along the support plane
     PVector velocityTangent = PVector.sub(velocity, velocityNormal);
 
-    PVector forward = getForwardOnPlane(grndNorm);
-    PVector right = grndNorm.cross(forward);
+    // forward is current heading projected onto the support plane
+    PVector forward = getForwardOnPlane(supportNormal);
+
+    // right gives us sideways motion relative to heading
+    PVector right = supportNormal.cross(forward);
     if (right.magSq() < 0.000001f) right = new PVector(0, 0, 1);
     else right.normalize();
 
     float forwardSpeed = velocityTangent.dot(forward);
     float sideSpeed = velocityTangent.dot(right);
 
+    // steering gets stronger as forward motion increases
     float steerFactor = 0.25f + 0.75f * min(abs(forwardSpeed) / maxForwardSpeed, 1.0f);
     yaw += steer * steerRate * steerFactor;
 
-    // recalc after yaw changes
-    forward = getForwardOnPlane(grndNorm);
-    right = grndNorm.cross(forward);
+    // recalc basis after yaw changed
+    forward = getForwardOnPlane(supportNormal);
+    right = supportNormal.cross(forward);
     if (right.magSq() < 0.000001f) right = new PVector(0, 0, 1);
     else right.normalize();
 
     forwardSpeed = velocityTangent.dot(forward);
     sideSpeed = velocityTangent.dot(right);
 
+    // apply forward/back acceleration along the support plane
     if (throttle > 0) {
       velocityTangent.add(PVector.mult(forward, engineAccel * throttle));
     } else if (throttle < 0) {
       velocityTangent.add(PVector.mult(forward, brakeAccel * throttle));
     }
 
-    // kill sideways slide without killing all tangential motion
+    // kill some sideways drift without zeroing out all tangent motion
     velocityTangent.add(PVector.mult(right, -sideSpeed * lateralGrip));
 
-    // drag
+    // use stronger drag when not actively driving
     if (abs(throttle) < 0.001f) velocityTangent.mult(1.0f - coastDrag);
     else                        velocityTangent.mult(1.0f - driveDrag);
 
-    // clamp forward / reverse speed
+    // clamp speed along the current forward axis
     forwardSpeed = velocityTangent.dot(forward);
     float clampedForward = constrain(forwardSpeed, -maxReverseSpeed, maxForwardSpeed);
     velocityTangent.add(PVector.mult(forward, clampedForward - forwardSpeed));
 
-    // extra safety clamp on total planar speed
+    // safety clamp on total tangent speed
     if (velocityTangent.mag() > maxPlanarSpeed) {
       velocityTangent.normalize().mult(maxPlanarSpeed);
     }
 
+    // rebuild final velocity from tangent + normal components
     velocity.set(PVector.add(velocityTangent, velocityNormal));
   }
 
+  /*
+   * Air movement is weaker:
+   * - throttle still nudges forward/back along current heading
+   * - steer still rotates heading a bit
+   * - light drag stops air motion from growing forever
+   */
   void applyAirControl(float throttle, float steer) {
     PVector forward = getFlatForward();
 
@@ -470,6 +555,10 @@ class Ball {
     velocity.mult(1.0f - airDrag);
   }
 
+  /*
+   * Clamp the sphere inside the prototype world.
+   * When blocked by a boundary, zero the velocity on that axis instead of bouncing.
+   */
   void solveBounds() {
     if (position.x < radius) {
       position.x = radius;
@@ -501,27 +590,41 @@ class Ball {
     }
   }
 
+  /*
+   * Terrain support solve:
+   * - sample ground height + normal under the sphere
+   * - if close enough, snap the sphere onto the support surface
+   * - remove only the part of velocity moving into the surface normal
+   * - keep tangent motion so the sphere can continue to travel across the slope
+   *
+   * This is the main thing stopping floaty bounce behavior.
+   */
   void solveTerrainCollision() {
     grounded = false;
 
     float groundY = terrainHeightAt(position.x, position.z);
     PVector terrainNormal = terrainNormalAt(position.x, position.z);
 
-    float verticalCorrection = (position.y + radius) - groundY; // >0 = penetrating, <0 = hovering
-    float velocityNormal = velocity.dot(terrainNormal);                            // relative to upward normal
+    // > 0 means the bottom of the sphere is inside the terrain
+    // < 0 means the sphere is hovering above the terrain
+    float supportPenetrationOrGap = (position.y + radius) - groundY;
+
+    // velocity projected onto terrain normal tells us how much we are moving into/out of the surface
+    float velocityAlongTerrainNormal = velocity.dot(terrainNormal);
 
     boolean canSnap =
-      verticalCorrection >= -groundSnapDist &&
-      velocityNormal < groundDetachSpeed;
+      supportPenetrationOrGap >= -groundSnapDist &&
+      velocityAlongTerrainNormal < groundDetachSpeed;
 
     if (canSnap) {
-      float correctionDist = verticalCorrection / max(0.15f, -terrainNormal.y);
+      // convert vertical penetration/gap into movement along the support normal
+      float correctionDist = supportPenetrationOrGap / max(0.15f, -terrainNormal.y);
       position.add(PVector.mult(terrainNormal, correctionDist));
 
-      // remove only velocity into the surface
-      velocityNormal = velocity.dot(terrainNormal);
-      if (velocityNormal < 0) {
-        velocity.sub(PVector.mult(terrainNormal, velocityNormal));
+      // remove only inward normal velocity; do not touch tangent velocity
+      velocityAlongTerrainNormal = velocity.dot(terrainNormal);
+      if (velocityAlongTerrainNormal < 0) {
+        velocity.sub(PVector.mult(terrainNormal, velocityAlongTerrainNormal));
       }
 
       grounded = true;
@@ -532,30 +635,51 @@ class Ball {
     }
   }
 
+  /*
+   * Flat heading direction used for camera and air control.
+   */
   PVector getFlatForward() {
     PVector forward = new PVector(cos(yaw), 0, sin(yaw));
+
     if (forward.magSq() < 0.000001f) forward.set(1, 0, 0);
     else forward.normalize();
+
     return forward;
   }
 
-  PVector getForwardOnPlane(PVector n) {
+  /*
+   * Heading direction projected onto the current support plane.
+   * This makes forward motion follow the slope instead of fighting it.
+   */
+  PVector getForwardOnPlane(PVector supportNormal) {
     PVector forward = new PVector(cos(yaw), 0, sin(yaw));
-    forward = projectOntoPlane(forward, n);
+    forward = projectOntoPlane(forward, supportNormal);
+
     if (forward.magSq() < 0.000001f) forward = new PVector(1, 0, 0);
     else forward.normalize();
+
     return forward;
   }
 
+  /*
+   * Planar speed = velocity with the normal component removed.
+   * Useful for HUD/debug because it measures actual travel across the surface.
+   */
   float getPlanarSpeed() {
-    PVector normal = grounded ? groundNormal : new PVector(0, -1, 0);
-    PVector velocityTangent = PVector.sub(velocity, PVector.mult(normal, velocity.dot(normal)));
+    PVector supportNormal = grounded ? groundNormal : new PVector(0, -1, 0);
+    PVector velocityTangent = PVector.sub(velocity, PVector.mult(supportNormal, velocity.dot(supportNormal)));
+
     return velocityTangent.mag();
   }
 
+  /*
+   * Small debug impulse:
+   * - pushes away from the support normal
+   * - adds a little random sideways motion
+   */
   void bump() {
-    PVector normal = grounded ? groundNormal.copy() : new PVector(0, -1, 0);
-    velocity.add(PVector.mult(normal, u(3.8f)));
+    PVector supportNormal = grounded ? groundNormal.copy() : new PVector(0, -1, 0);
+    velocity.add(PVector.mult(supportNormal, u(3.8f)));
 
     PVector side = new PVector(random(-1, 1), 0, random(-1, 1));
     if (side.magSq() > 0.000001f) side.normalize();
@@ -573,7 +697,7 @@ class Ball {
     sphereDetail(18);
     sphere(radius);
 
-    // directional nose so heading reads like a tiny player
+    // small forward marker so heading is easy to read
     pushMatrix();
     rotateY(yaw);
     translate(radius * 0.82f, 0, 0);
@@ -581,7 +705,7 @@ class Ball {
     box(radius * 0.9f, radius * 0.25f, radius * 0.38f);
     popMatrix();
 
-    // top marker
+    // top marker makes the silhouette easier to read
     pushMatrix();
     translate(0, -radius * 0.65f, 0);
     fill(90, 90, 95);
@@ -592,21 +716,19 @@ class Ball {
   }
 
   /*
-  * Helper Debug Visual function to highlight cells 
-  */
+   * Helper debug visual:
+   * mark the touched terrain cell plus direct neighbors so the contact patch reads better.
+   */
   void markCollidingCell(float x_, float z_) {
-    // translate position into grid indices
-    int xCellAxisIndex = constrain(floor(x_ / cellW), 0, cols - 2); // width
-    int zCellAxisIndex = constrain(floor(z_ / cellD), 0, rows - 2); // depth
+    int xCellAxisIndex = constrain(floor(x_ / cellW), 0, cols - 2);
+    int zCellAxisIndex = constrain(floor(z_ / cellD), 0, rows - 2);
 
-    // enable collision indication bool - changes colour of ground cell currently
     cells[xCellAxisIndex][zCellAxisIndex].colliding = true;
 
-    // adjaceny check  - flag neighbors too 
-    if (xCellAxisIndex > 0)         cells[xCellAxisIndex - 1][zCellAxisIndex].colliding = true;
-    if (xCellAxisIndex < cols - 2)  cells[xCellAxisIndex + 1][zCellAxisIndex].colliding = true;
-    if (zCellAxisIndex > 0)         cells[xCellAxisIndex][zCellAxisIndex - 1].colliding = true;
-    if (zCellAxisIndex < rows - 2)  cells[xCellAxisIndex][zCellAxisIndex + 1].colliding = true;
+    if (xCellAxisIndex > 0)        cells[xCellAxisIndex - 1][zCellAxisIndex].colliding = true;
+    if (xCellAxisIndex < cols - 2) cells[xCellAxisIndex + 1][zCellAxisIndex].colliding = true;
+    if (zCellAxisIndex > 0)        cells[xCellAxisIndex][zCellAxisIndex - 1].colliding = true;
+    if (zCellAxisIndex < rows - 2) cells[xCellAxisIndex][zCellAxisIndex + 1].colliding = true;
   }
 }
 
