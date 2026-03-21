@@ -55,6 +55,7 @@ boolean jumpQueued = false;
 void setup() {
   size(600, 600, P3D);
   noSmooth();
+  pixelDensity(1);
 
   cellW = worldW / (cols - 1.0f);
   cellD = worldD / (rows - 1.0f);
